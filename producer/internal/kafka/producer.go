@@ -28,7 +28,7 @@ type AsyncCallback interface {
 type IProducerKafka interface {
 	ProduceMessage(topicConfig TopicConfig, message Message) error
 	ProduceMessages(topicConfig TopicConfig, messages []Message) error
-	ProduceMessageAsync(topicConfig TopicConfig, message Message, handler AsyncCallback)
+	ProduceMessageAsync(topicConfig TopicConfig, message AsyncMessage)
 	ProduceMessagesAsync(topicConfig TopicConfig, messages []AsyncMessage)
 	Close() error
 }
@@ -51,20 +51,17 @@ type AsyncMessage interface {
 	AsyncCallback
 }
 
-// KafkaProducer implements IProducerKafka using sarama.
-type KafkaProducer struct {
+type producer struct {
 	syncProducer  sarama.SyncProducer
 	asyncProducer sarama.AsyncProducer
 	config        ProducerConfig
 }
 
-// New creates a new Kafka producer with the given configuration.
 func New(config ProducerConfig) (IProducerKafka, error) {
 	if len(config.Brokers) == 0 {
 		return nil, fmt.Errorf("at least one broker must be specified")
 	}
 
-	// Set defaults
 	if config.RetryMax == 0 {
 		config.RetryMax = 3
 	}
@@ -86,35 +83,33 @@ func New(config ProducerConfig) (IProducerKafka, error) {
 	saramaConfig.Producer.RequiredAcks = config.RequiredAcks
 	saramaConfig.Producer.Compression = config.Compression
 
-	// Create sync producer
-	syncProducer, err := sarama.NewSyncProducer(config.Brokers, saramaConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create sync Kafka producer: %w", err)
+	kp := &producer{
+		config: config,
 	}
 
-	kp := &KafkaProducer{
-		syncProducer: syncProducer,
-		config:       config,
-	}
-
-	// Create async producer if requested
 	if config.Async {
 		asyncProducer, err := sarama.NewAsyncProducer(config.Brokers, saramaConfig)
 		if err != nil {
-			syncProducer.Close()
 			return nil, fmt.Errorf("failed to create async Kafka producer: %w", err)
 		}
+
 		kp.asyncProducer = asyncProducer
 
-		// Start goroutine to handle async callbacks
 		go kp.handleAsyncCallbacks()
+	} else {
+		syncProducer, err := sarama.NewSyncProducer(config.Brokers, saramaConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create sync Kafka producer: %w", err)
+		}
+
+		kp.syncProducer = syncProducer
 	}
 
 	return kp, nil
 }
 
 // ProduceMessage sends a single message to Kafka.
-func (p *KafkaProducer) ProduceMessage(topicConfig TopicConfig, message Message) error {
+func (p *producer) ProduceMessage(topicConfig TopicConfig, message Message) error {
 	producerMessage := &sarama.ProducerMessage{
 		Topic:     topicConfig.Topic,
 		Partition: topicConfig.Partition,
@@ -134,7 +129,7 @@ func (p *KafkaProducer) ProduceMessage(topicConfig TopicConfig, message Message)
 }
 
 // ProduceMessages sends multiple messages to Kafka in batch.
-func (p *KafkaProducer) ProduceMessages(topicConfig TopicConfig, messages []Message) error {
+func (p *producer) ProduceMessages(topicConfig TopicConfig, messages []Message) error {
 	if len(messages) == 0 {
 		return fmt.Errorf("no messages to send")
 	}
@@ -160,41 +155,41 @@ func (p *KafkaProducer) ProduceMessages(topicConfig TopicConfig, messages []Mess
 }
 
 // ProduceMessageAsync sends a single message to Kafka asynchronously.
-func (p *KafkaProducer) ProduceMessageAsync(topicConfig TopicConfig, message Message, handler AsyncCallback) {
+func (p *producer) ProduceMessageAsync(topicConfig TopicConfig, message AsyncMessage) {
 	if p.asyncProducer == nil {
-		if handler != nil {
-			handler.Callback(0, 0, fmt.Errorf("async producer not enabled"))
+		if message != nil {
+			safeInvokeCallback(message, 0, 0, fmt.Errorf("async producer not enabled"))
 		}
+		return
+	}
+
+	if message == nil {
 		return
 	}
 
 	producerMessage := &sarama.ProducerMessage{
 		Topic:     topicConfig.Topic,
 		Partition: topicConfig.Partition,
-		Key:       sarama.StringEncoder(message.Key),
-		Value:     sarama.ByteEncoder(message.Value),
+		Key:       sarama.StringEncoder(message.GetKey()),
+		Value:     sarama.ByteEncoder(message.GetValue()),
 		Timestamp: time.Now(),
+		Metadata:  message,
 	}
-
-	// Store handler in metadata for later retrieval
-	producerMessage.Metadata = handler
 
 	select {
 	case p.asyncProducer.Input() <- producerMessage:
-		// Message queued successfully
+		// queued
 	default:
-		if handler != nil {
-			handler.Callback(0, 0, fmt.Errorf("producer input channel is full"))
-		}
+		safeInvokeCallback(message, 0, 0, fmt.Errorf("producer input channel is full"))
 	}
 }
 
 // ProduceMessagesAsync sends multiple messages to Kafka asynchronously.
-func (p *KafkaProducer) ProduceMessagesAsync(topicConfig TopicConfig, messages []AsyncMessage) {
+func (p *producer) ProduceMessagesAsync(topicConfig TopicConfig, messages []AsyncMessage) {
 	if p.asyncProducer == nil {
 		for _, m := range messages {
 			if m != nil {
-				m.Callback(0, 0, fmt.Errorf("async producer not enabled"))
+				safeInvokeCallback(m, 0, 0, fmt.Errorf("async producer not enabled"))
 			}
 		}
 		return
@@ -220,29 +215,47 @@ func (p *KafkaProducer) ProduceMessagesAsync(topicConfig TopicConfig, messages [
 		select {
 		case p.asyncProducer.Input() <- pm:
 		default:
-			m.Callback(0, 0, fmt.Errorf("producer input channel is full"))
+			safeInvokeCallback(m, 0, 0, fmt.Errorf("producer input channel is full"))
 		}
 	}
 }
 
 // handleAsyncCallbacks processes success and error callbacks for async messages.
-func (p *KafkaProducer) handleAsyncCallbacks() {
+func (p *producer) handleAsyncCallbacks() {
 	for {
 		select {
-		case success := <-p.asyncProducer.Successes():
-			if handler, ok := success.Metadata.(AsyncCallback); ok && handler != nil {
-				handler.Callback(success.Partition, success.Offset, nil)
+		case success, ok := <-p.asyncProducer.Successes():
+			if !ok {
+				return
 			}
-		case err := <-p.asyncProducer.Errors():
-			if handler, ok := err.Msg.Metadata.(AsyncCallback); ok && handler != nil {
-				handler.Callback(0, 0, err.Err)
+			if success != nil {
+				if handler, ok := success.Metadata.(AsyncCallback); ok && handler != nil {
+					safeInvokeCallback(handler, success.Partition, success.Offset, nil)
+				}
+			}
+		case errItem, ok := <-p.asyncProducer.Errors():
+			if !ok {
+				return
+			}
+			if errItem != nil && errItem.Msg != nil {
+				if handler, ok := errItem.Msg.Metadata.(AsyncCallback); ok && handler != nil {
+					safeInvokeCallback(handler, 0, 0, errItem.Err)
+				}
 			}
 		}
 	}
 }
 
-// Close closes the Kafka producer.
-func (p *KafkaProducer) Close() error {
+func safeInvokeCallback(cb AsyncCallback, partition int32, offset int64, err error) {
+	defer func() {
+		_ = recover()
+	}()
+	if cb != nil {
+		cb.Callback(partition, offset, err)
+	}
+}
+
+func (p *producer) Close() error {
 	var err error
 	if p.syncProducer != nil {
 		err = p.syncProducer.Close()
