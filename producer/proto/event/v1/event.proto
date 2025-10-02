@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package event.v1;
+
+option go_package = "vinnipuh1982/producer/generated/proto/event/v1;eventv1";
+
+message Event {
+  string event_id = 1; // UUID as string
+  string type = 2;
+  map<string, string> data = 3;
+}
