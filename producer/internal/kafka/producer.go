@@ -24,7 +24,6 @@ type AsyncCallback interface {
 	Callback(partition int32, offset int64, err error)
 }
 
-// IProducerKafka defines the interface for Kafka message production.
 type IProducerKafka interface {
 	ProduceMessage(topicConfig TopicConfig, message Message) error
 	ProduceMessages(topicConfig TopicConfig, messages []Message) error
@@ -33,7 +32,6 @@ type IProducerKafka interface {
 	Close() error
 }
 
-// ProducerConfig holds configuration for Kafka producer.
 type ProducerConfig struct {
 	Brokers []string
 	// Optional configurations
@@ -184,7 +182,6 @@ func (p *producer) ProduceMessageAsync(topicConfig TopicConfig, message AsyncMes
 	}
 }
 
-// ProduceMessagesAsync sends multiple messages to Kafka asynchronously.
 func (p *producer) ProduceMessagesAsync(topicConfig TopicConfig, messages []AsyncMessage) {
 	if p.asyncProducer == nil {
 		for _, m := range messages {
